@@ -25,12 +25,14 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
         private const val CLEANUP_INTERVAL = com.bitchat.android.util.AppConstants.Security.CLEANUP_INTERVAL_MS // 5 minutes
         private const val MAX_PROCESSED_MESSAGES = com.bitchat.android.util.AppConstants.Security.MAX_PROCESSED_MESSAGES
         private const val MAX_PROCESSED_KEY_EXCHANGES = com.bitchat.android.util.AppConstants.Security.MAX_PROCESSED_KEY_EXCHANGES
+        private const val KEY_EXCHANGE_DEDUP_TIMEOUT = com.bitchat.android.util.AppConstants.Security.KEY_EXCHANGE_DEDUP_TIMEOUT_MS
     }
     
     // Security tracking
     private val processedMessages = Collections.synchronizedSet(mutableSetOf<String>())
     private val processedKeyExchanges = Collections.synchronizedSet(mutableSetOf<String>())
     private val messageTimestamps = Collections.synchronizedMap(mutableMapOf<String, Long>())
+    private val keyExchangeTimestamps = Collections.synchronizedMap(mutableMapOf<String, Long>())
     
     // Delegate for callbacks
     var delegate: SecurityManagerDelegate? = null
@@ -48,7 +50,6 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
     fun validatePacket(packet: BitchatPacket, peerID: String): Boolean {
         // Skip validation for our own packets
         if (peerID == myPeerID) {
-            Log.d(TAG, "Skipping validation for our own packet")
             return false
         }
         
@@ -77,21 +78,18 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
         
         if (processedMessages.contains(messageID)) {
             // Check for ANNOUNCE exception: allow if it looks like a direct neighbor (max TTL)
-            // This ensures we catch the "first announce" on a new connection for binding,
+            // This ensures we observe the same peer on a new direct transport connection,
             // while still dropping looped/relayed duplicates.
             val isFreshAnnounce = messageType == MessageType.ANNOUNCE &&
                     packet.ttl >= com.bitchat.android.util.AppConstants.MESSAGE_TTL_HOPS
 
             if (!isFreshAnnounce) {
-                Log.d(TAG, "Dropping duplicate packet: $messageID")
                 return false
             }
-            Log.d(TAG, "Allowing duplicate ANNOUNCE from direct neighbor: $messageID")
         }
 
         // Enforce mandatory signature verification
         if (!verifyPacketSignature(packet, peerID)) {
-            Log.w(TAG, "Dropping packet from $peerID due to signature verification failure")
             return false
         }
 
@@ -100,8 +98,7 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
         // later legitimate packet with the same timestamp and payload.
         processedMessages.add(messageID)
         messageTimestamps[messageID] = currentTime
-        
-        Log.d(TAG, "Packet validation passed for $peerID, messageID: $messageID")
+
         return true
     }
     
@@ -115,36 +112,33 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
 
         // Skip handshakes not addressed to us
         if (packet.recipientID?.toHexString() != myPeerID) {
-            Log.d(TAG, "Skipping handshake not addressed to us: $peerID")
             return false
         }
-            
+
         // Skip our own handshake messages
         if (peerID == myPeerID) return false
 
         if (packet.payload.isEmpty()) {
-            Log.w(TAG, "Noise handshake packet has empty payload")
+            Log.d(TAG, "Noise handshake packet has empty payload")
             return false
         }
-        
+
         // Prevent duplicate handshake processing
         val exchangeKey = "$peerID-${packet.payload.sliceArray(0 until minOf(16, packet.payload.size)).contentHashCode()}"
-        
+
         if (processedKeyExchanges.contains(exchangeKey)) {
-            Log.d(TAG, "Already processed handshake: $exchangeKey")
             return false
         }
-        Log.d(TAG, "Processing Noise handshake from $peerID (${packet.payload.size} bytes)")
-        
+
         try {
             // The session manager preserves an existing transport in a separate responder-candidate
             // flow and reports whether this exact frame completed authentication. Never infer that
             // from ambient session state: a rejected replacement may leave the old session active.
             val result = encryptionService.processHandshakeMessageWithResult(packet.payload, peerID)
             processedKeyExchanges.add(exchangeKey)
+            keyExchangeTimestamps[exchangeKey] = System.currentTimeMillis()
             
             if (result.response != null) {
-                Log.d(TAG, "Successfully processed Noise handshake from $peerID, sending response")
                 // Send handshake response through delegate
                 delegate?.sendHandshakeResponse(peerID, result.response)
             }
@@ -162,7 +156,7 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
                     return false
                 }
                 val isDirectIngress = packet.ttl == com.bitchat.android.util.AppConstants.MESSAGE_TTL_HOPS
-                Log.d(TAG, "✅ Noise handshake completed with $peerID")
+                Log.i(TAG, "Noise handshake completed with $peerID")
                 delegate?.onKeyExchangeCompleted(
                     peerID = peerID,
                     authenticatedRemoteStaticKey = authenticatedRemoteStaticKey,
@@ -175,7 +169,7 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
 
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to process Noise handshake from $peerID: ${e.message}")
+            Log.w(TAG, "Failed to process Noise handshake from $peerID: ${e.message}")
             return false
         }
     }
@@ -315,7 +309,7 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
 
             // 1. Mandatory Signature Check
             if (packet.signature == null) {
-                Log.w(TAG, "❌ Signature check for $peerID: NO_SIGNATURE (packet type ${packet.type})")
+                Log.w(TAG, "Signature check for $peerID: NO_SIGNATURE (packet type ${packet.type})")
                 return false
             }
             
@@ -326,14 +320,14 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
             if (signingPublicKey == null) {
                 // If we don't have a key (and it's not an announce), we can't verify.
                 // For security, we must reject packets from unknown peers unless it's an announce.
-                Log.w(TAG, "❌ Signature check for $peerID: NO_SIGNING_KEY_AVAILABLE (packet type ${packet.type})")
+                Log.w(TAG, "Signature check for $peerID: NO_SIGNING_KEY_AVAILABLE (packet type ${packet.type})")
                 return false
             }
             
             // 3. Get Canonical Data
             val packetDataForSigning = packet.toBinaryDataForSigning()
             if (packetDataForSigning == null) {
-                Log.w(TAG, "❌ Signature check for $peerID: ENCODING_ERROR (packet type ${packet.type})")
+                Log.w(TAG, "Signature check for $peerID: ENCODING_ERROR (packet type ${packet.type})")
                 return false
             }
             
@@ -346,15 +340,14 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
             )
             
             if (isSignatureValid) {
-                // Log.v(TAG, "✅ Signature verified for $peerID (type ${packet.type})")
                 return true
             } else {
-                Log.w(TAG, "❌ Signature INVALID for $peerID (type ${packet.type})")
+                Log.w(TAG, "Signature INVALID for $peerID (type ${packet.type})")
                 return false
             }
-            
+
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Signature verification error for $peerID: ${e.message}")
+            Log.e(TAG, "Signature verification error for $peerID: ${e.message}")
             return false
         }
     }
@@ -403,40 +396,45 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
     /**
      * Clean up old processed messages and timestamps
      */
-    private fun cleanupOldData() {
-        val cutoffTime = System.currentTimeMillis() - MESSAGE_TIMEOUT
-        var removedCount = 0
-        
+    internal fun cleanupOldData(nowMs: Long = System.currentTimeMillis()) {
+        val cutoffTime = nowMs - MESSAGE_TIMEOUT
+
         // Clean up old message timestamps and corresponding processed messages
         val messagesToRemove = messageTimestamps.entries.filter { (_, timestamp) ->
             timestamp < cutoffTime
         }.map { it.key }
-        
+
         messagesToRemove.forEach { messageId ->
             messageTimestamps.remove(messageId)
-            if (processedMessages.remove(messageId)) {
-                removedCount++
-            }
+            processedMessages.remove(messageId)
         }
-        
+
         // Limit the size of processed messages set
         if (processedMessages.size > MAX_PROCESSED_MESSAGES) {
             val excess = processedMessages.size - MAX_PROCESSED_MESSAGES
             val toRemove = processedMessages.take(excess)
             processedMessages.removeAll(toRemove.toSet())
             removeFromMessageTimestamps(toRemove)
-            removedCount += excess
         }
-        
+
+        // Expire handshake dedup entries by time so a delayed same-ephemeral delivery
+        // (e.g. a re-handshake retry after a failed attempt) is not blocked forever.
+        val keyExchangeCutoff = nowMs - KEY_EXCHANGE_DEDUP_TIMEOUT
+        val keyExchangesToRemove = keyExchangeTimestamps.entries.filter { (_, timestamp) ->
+            timestamp < keyExchangeCutoff
+        }.map { it.key }
+
+        keyExchangesToRemove.forEach { exchangeKey ->
+            keyExchangeTimestamps.remove(exchangeKey)
+            processedKeyExchanges.remove(exchangeKey)
+        }
+
         // Limit the size of processed key exchanges set
         if (processedKeyExchanges.size > MAX_PROCESSED_KEY_EXCHANGES) {
             val excess = processedKeyExchanges.size - MAX_PROCESSED_KEY_EXCHANGES
             val toRemove = processedKeyExchanges.take(excess)
             processedKeyExchanges.removeAll(toRemove.toSet())
-        }
-        
-        if (removedCount > 0) {
-            Log.d(TAG, "Cleaned up $removedCount old processed messages")
+            toRemove.forEach { keyExchangeTimestamps.remove(it) }
         }
     }
     
@@ -456,6 +454,7 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
         processedMessages.clear()
         processedKeyExchanges.clear()
         messageTimestamps.clear()
+        keyExchangeTimestamps.clear()
     }
     
     /**
